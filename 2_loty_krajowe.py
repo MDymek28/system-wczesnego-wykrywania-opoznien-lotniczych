@@ -1,6 +1,6 @@
-import os
 import re
 import json
+import argparse
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, Optional, Set, List, Tuple
@@ -10,14 +10,10 @@ from shapely.geometry import shape, Point
 from shapely.ops import unary_union
 
 # === KONFIGURACJA ===
-# INPUT
-DATA_DIR = "/Users/malgorzata/Library/CloudStorage/OneDrive-SGH/PRACA MAGISTERSKA/2022_06_27/DANE"
-DAY_STR  = "2022-06-27"
-POLAND_GEOJSON = "/Users/malgorzata/Library/CloudStorage/OneDrive-SGH/PRACA MAGISTERSKA/2022_06_27/DANE/poland.geojson"
+POLAND_GEOJSON_NAME = "poland.geojson"
+SUPPORTED_EXTENSIONS = {".csv", ".json", ".xlsx", ".xls"}
 
-# OUTPUT
-OUTPUT_TXT   = f"poland_flights_summary_{DAY_STR}.txt"
-OUTPUT_EXCEL = f"flights_in_poland_{DAY_STR}.xlsx"
+
 # ==================================================
 
 @dataclass
@@ -54,7 +50,7 @@ def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     cols = {c.lower(): c for c in df.columns}
 
     def has(*cands):
-        return next((cols[c] for c in cands if c in cols), None)
+        return next((cols[c.lower()] for c in cands if c.lower() in cols), None)
 
     cs = has("callsign")
     if cs is None:
@@ -122,8 +118,101 @@ def read_raw_file(path: Path) -> pd.DataFrame:
         raise ValueError(f"Nieobslugiwane rozszerzenie: {ext}")
 
 
+def read_first_row(path: Path) -> pd.DataFrame:
+    """
+    Odczytuje pierwszy rekord z pliku.
+    Służy do automatycznego pobrania daty z kolumny utc_date.
+    """
+    ext = path.suffix.lower()
+
+    if ext == ".csv":
+        return pd.read_csv(path, nrows=1)
+
+    if ext in [".xlsx", ".xls"]:
+        return pd.read_excel(path, nrows=1)
+
+    if ext == ".json":
+        df = read_raw_file(path)
+        return df.head(1)
+
+    raise ValueError(f"Nieobslugiwane rozszerzenie: {ext}")
+
+
+def get_day_str_from_first_file(first_file: Path) -> str:
+    """
+    Pobiera datę z kolumny utc_date z pierwszego rekordu pierwszego pliku danych.
+    """
+    df = read_first_row(first_file)
+
+    if df.empty:
+        raise ValueError(f"Plik {first_file.name} nie zawiera żadnych rekordów.")
+
+    cols = {c.lower(): c for c in df.columns}
+
+    if "utc_date" not in cols:
+        raise ValueError(
+            f"Nie znaleziono kolumny 'utc_date' w pierwszym pliku: {first_file.name}"
+        )
+
+    utc_date_col = cols["utc_date"]
+    value = df.iloc[0][utc_date_col]
+
+    if pd.isna(value):
+        raise ValueError(
+            f"Pierwszy rekord w pliku {first_file.name} ma pustą wartość w kolumnie 'utc_date'."
+        )
+
+    if hasattr(value, "strftime"):
+        day_str = value.strftime("%Y-%m-%d")
+    else:
+        day_str = str(value).strip()[:10]
+
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day_str):
+        raise ValueError(
+            f"Nieprawidłowy format daty w kolumnie 'utc_date': {value}. "
+            "Oczekiwany format to YYYY-MM-DD."
+        )
+
+    return day_str
+
+
+def find_all_state_data_files(data_dir: Path) -> List[Path]:
+    """
+    Wyszukuje wszystkie pliki danych typu states_YYYY-MM-DD-HH
+    z obsługiwanymi rozszerzeniami.
+    """
+    pattern = re.compile(
+        r"states_\d{4}-\d{2}-\d{2}-\d{2}\.(csv|json|xlsx|xls)$",
+        re.IGNORECASE
+    )
+
+    files = [
+        f for f in data_dir.iterdir()
+        if f.is_file()
+           and f.suffix.lower() in SUPPORTED_EXTENSIONS
+           and pattern.fullmatch(f.name)
+    ]
+
+    return sorted(files, key=lambda x: x.name)
+
+
+def filter_files_for_day(files: List[Path], day_str: str) -> List[Path]:
+    """
+    Zostawia tylko pliki dotyczące dnia wykrytego z kolumny utc_date.
+    """
+    pattern = re.compile(
+        rf"states_{re.escape(day_str)}-\d{{2}}\.(csv|json|xlsx|xls)$",
+        re.IGNORECASE
+    )
+
+    return sorted(
+        [f for f in files if pattern.fullmatch(f.name)],
+        key=lambda x: x.name
+    )
+
+
 # === ANALIZA DNIA ===
-def analyze_day(files: List[Path], pl_geom):
+def analyze_day(files: List[Path], pl_geom, output_excel: str):
     day_over: Set[str] = set()
     day_dep: Set[str] = set()
     day_arr: Set[str] = set()
@@ -139,7 +228,12 @@ def analyze_day(files: List[Path], pl_geom):
     for path in files:
         print(f"Analiza {path.name}...")
 
-        hour_tag = re.search(r"states_\d{4}-\d{2}-\d{2}-(\d{2})", path.stem, re.IGNORECASE)
+        hour_tag = re.search(
+            r"states_\d{4}-\d{2}-\d{2}-(\d{2})",
+            path.stem,
+            re.IGNORECASE
+        )
+
         hour = hour_tag.group(1) if hour_tag else "??"
 
         raw_df = read_raw_file(path)
@@ -147,7 +241,10 @@ def analyze_day(files: List[Path], pl_geom):
         df = normalize_df(raw_df)
         df = df.sort_values("ts")
 
-        df["inside"] = df.apply(lambda r: inside_pl(pl_geom, r["lat"], r["lon"]), axis=1)
+        df["inside"] = df.apply(
+            lambda r: inside_pl(pl_geom, r["lat"], r["lon"]),
+            axis=1
+        )
 
         inside_idx = df.index[df["inside"]]
         if len(inside_idx) > 0:
@@ -157,7 +254,7 @@ def analyze_day(files: List[Path], pl_geom):
             collected_dfs.append(inside_raw)
 
             combined = pd.concat(collected_dfs, ignore_index=True)
-            combined.to_excel(OUTPUT_EXCEL, index=False)
+            combined.to_excel(output_excel, index=False)
 
         over_set: Set[str] = set()
         dep_set: Set[str] = set()
@@ -192,33 +289,133 @@ def analyze_day(files: List[Path], pl_geom):
         per_hour_arr[hour] = arr_set
 
         day_over |= over_set
-        day_dep  |= dep_set
-        day_arr  |= arr_set
+        day_dep |= dep_set
+        day_arr |= arr_set
 
     return day_over, day_dep, day_arr, per_hour_over, per_hour_dep, per_hour_arr
 
 
+def get_script_directory() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def find_default_poland_geojson(script_dir: Path) -> Path:
+    """
+    Szuka pliku poland.geojson w domyślnych lokalizacjach:
+    1. w folderze skryptu,
+    2. w folderze res znajdującym się obok skryptu.
+    """
+    possible_paths = [
+        script_dir / POLAND_GEOJSON_NAME,
+        script_dir / "res" / POLAND_GEOJSON_NAME,
+        ]
+
+    for path in possible_paths:
+        if path.exists():
+            return path.resolve()
+
+    checked_paths = "\n".join(f"- {path}" for path in possible_paths)
+
+    raise SystemExit(
+        "Nie podano ścieżki do pliku poland.geojson i nie znaleziono go "
+        "w domyślnych lokalizacjach:\n"
+        f"{checked_paths}"
+    )
+
+
+def get_paths_from_args() -> Tuple[Path, Path]:
+    script_dir = get_script_directory()
+
+    parser = argparse.ArgumentParser(
+        description="Analizuje loty nad Polską na podstawie plików CSV/JSON/XLSX."
+    )
+
+    parser.add_argument(
+        "data_dir",
+        nargs="?",
+        default=str(script_dir),
+        help=(
+            "Ścieżka do folderu z danymi. "
+            "Jeśli nie zostanie podana, użyty zostanie folder skryptu."
+        )
+    )
+
+    parser.add_argument(
+        "poland_geojson",
+        nargs="?",
+        default=None,
+        help=(
+            "Ścieżka do pliku poland.geojson. "
+            "Jeśli nie zostanie podana, skrypt szuka pliku w folderze skryptu "
+            "oraz w folderze res obok skryptu."
+        )
+    )
+
+    args = parser.parse_args()
+
+    data_dir = Path(args.data_dir).expanduser().resolve()
+
+    if args.poland_geojson:
+        poland_geojson = Path(args.poland_geojson).expanduser().resolve()
+    else:
+        poland_geojson = find_default_poland_geojson(script_dir)
+
+    return data_dir, poland_geojson
+
+
 # === MAIN ===
 def main():
-    pl_geom = load_poland_geometry(POLAND_GEOJSON)
+    data_dir, poland_geojson = get_paths_from_args()
 
-    p = Path(DATA_DIR)
-    pattern = re.compile(rf"states_{DAY_STR}-\d{{2}}\..+", re.IGNORECASE)
-    files = sorted([f for f in p.iterdir() if pattern.fullmatch(f.name)], key=lambda x: x.name)
+    print(f"Wykorzystywana ścieżka danych: {data_dir}")
+    print(f"Wykorzystywany plik GeoJSON: {poland_geojson}")
+
+    if not data_dir.is_dir():
+        raise SystemExit(f"Nie znaleziono folderu z danymi: {data_dir}")
+
+    if not poland_geojson.exists():
+        raise SystemExit(f"Nie znaleziono pliku GeoJSON: {poland_geojson}")
+
+    all_files = find_all_state_data_files(data_dir)
+
+    if not all_files:
+        raise SystemExit(
+            f"Nie znaleziono plików danych typu states_YYYY-MM-DD-HH w folderze: {data_dir}"
+        )
+
+    first_file = all_files[0]
+    day_str = get_day_str_from_first_file(first_file)
+
+    print(f"Pierwszy analizowany plik: {first_file.name}")
+    print(f"Wykryta data z kolumny utc_date: {day_str}")
+
+    files = filter_files_for_day(all_files, day_str)
 
     if not files:
-        raise SystemExit(f"Nie znaleziono plikow dla dnia {DAY_STR} w {DATA_DIR}")
+        raise SystemExit(f"Nie znaleziono plikow dla dnia {day_str} w {data_dir}")
 
-    day_over, day_dep, day_arr, perh_over, perh_dep, perh_arr = analyze_day(files, pl_geom)
+    print(f"Znaleziono {len(files)} plików dla dnia {day_str}.")
+
+    output_txt = f"poland_flights_summary_{day_str}.txt"
+    output_excel = f"flights_in_poland_{day_str}.xlsx"
+
+    pl_geom = load_poland_geometry(str(poland_geojson))
+
+    day_over, day_dep, day_arr, perh_over, perh_dep, perh_arr = analyze_day(
+        files,
+        pl_geom,
+        output_excel
+    )
 
     # === RAPORT ===
     lines = []
-    lines.append(f"Podsumowanie dla dnia {DAY_STR}")
+    lines.append(f"Podsumowanie dla dnia {day_str}")
     lines.append(f"  Przelecialo nad Polska: {len(day_over)}")
     lines.append(f"  Starty z Polski:        {len(day_dep)}")
     lines.append(f"  Ladowania w Polsce:     {len(day_arr)}")
     lines.append("")
     lines.append("Rozbicie na godziny (HH):")
+
     for hour in sorted(perh_over.keys()):
         lines.append(
             f"  {hour}: over={len(perh_over[hour])}  dep={len(perh_dep[hour])}  arr={len(perh_arr[hour])}"
@@ -227,10 +424,13 @@ def main():
     report = "\n".join(lines)
 
     print("\n" + report)
-    with open(OUTPUT_TXT, "w", encoding="utf-8") as f:
+
+    with open(output_txt, "w", encoding="utf-8") as f:
         f.write(report)
-    print(f"\nZapisano raport do pliku: {OUTPUT_TXT}")
-    print(f"Zebrane rekordy z terenu Polski a w pliku: {OUTPUT_EXCEL}")
+
+    print(f"\nZapisano raport do pliku: {output_txt}")
+    print(f"Zebrane rekordy z terenu Polski sa w pliku: {output_excel}")
+
 
 if __name__ == "__main__":
     main()
